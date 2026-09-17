@@ -124,8 +124,6 @@ for (const name of [
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-app.set("trust proxy", 1);
-
 app.use(session({
     secret: process.env.SESSION_SECRET || "CHANGE_THIS_SECRET_BEFORE_PRODUCTION",
     resave: false,
@@ -274,7 +272,7 @@ ${body}
 // HOME
 // ===============================
 
-app.get("/", requireUser, (req, res) => {
+app.get("/", (req, res) => {
     const search = String(req.query.search || "").trim();
     const categoryId = Number(req.query.category || 0);
 
@@ -366,7 +364,7 @@ ${categories.map(c => `<option value="${c.id}" ${categoryId === c.id ? "selected
 // MOVIE DETAILS
 // ===============================
 
-app.get("/movie/:id", requireUser, (req, res) => {
+app.get("/movie/:id", (req, res) => {
     const movie = db.prepare(`
         SELECT movies.*, categories.name AS category_name
         FROM movies
@@ -549,10 +547,10 @@ app.get("/login", (req, res) => {
 <h1>Login</h1>
 ${message}
 <form method="POST" action="/api/login">
-<label>Email or phone number</label>
-<input name="login" type="text" autocomplete="username" required placeholder="Enter your email or phone">
+<label>Email</label>
+<input name="email" type="email" required>
 <label>Password</label>
-<input name="password" type="password" autocomplete="current-password" required>
+<input name="password" type="password" required>
 <button type="submit">Login</button>
 </form>
 <p class="muted">Don't have an account? <a href="/register">Register</a></p>
@@ -561,47 +559,23 @@ ${message}
     res.send(page(req, "Login", body));
 });
 
-app.post("/api/login", (req, res, next) => {
-    const login = String(req.body.login || req.body.email || "").trim();
+app.post("/api/login", (req, res) => {
+    const email = String(req.body.email || "").trim().toLowerCase();
     const password = String(req.body.password || "");
 
-    if (!login || !password) {
-        return res.status(400).send(page(req, "Login", `
-<div class="container" style="max-width:500px"><div class="card">
-<h1>Login</h1>
-<div class="notice error">Please enter your email/phone and password.</div>
-<a class="button" href="/login">Try Again</a>
-</div></div>`));
-    }
-
-    const normalizedEmail = login.toLowerCase();
-    const user = db.prepare("SELECT * FROM users WHERE lower(email) = ? OR phone = ? LIMIT 1")
-        .get(normalizedEmail, login);
+    const user = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
 
     if (!user || !bcrypt.compareSync(password, user.password_hash)) {
-        return res.status(401).send(page(req, "Login Failed", `
-<div class="container" style="max-width:500px"><div class="card">
-<h1>Login Failed</h1>
-<div class="notice error">Invalid email/phone or password.</div>
-<a class="button" href="/login">Try Again</a>
-<a class="button secondary" href="/register">Create Account</a>
-</div></div>`));
+        return res.status(401).send("Invalid email or password.");
     }
 
     req.session.userId = user.id;
     req.session.userName = user.name;
-    req.session.save(err => {
-        if (err) return next(err);
-
-        // Returning users with an active subscription go straight to Home.
-        // Users without an active subscription go to the subscription page.
-        const activeSubscription = getActiveSubscription(user.id);
-        return res.redirect(activeSubscription ? "/" : "/subscribe");
-    });
+    res.redirect("/");
 });
 
 app.get("/logout", (req, res) => {
-    req.session.destroy(() => res.redirect("/login"));
+    req.session.destroy(() => res.redirect("/"));
 });
 
 // ===============================
@@ -669,11 +643,8 @@ ${plans.map(([id,name,amount,description]) => `
 <div class="price">${formatMoney(amount)}</div>
 <p class="muted">${description}</p>
 ${active
-    ? `<button type="button" class="button secondary" disabled style="opacity:.6;cursor:not-allowed">Already Subscribed</button>`
-    : `<form method="GET" action="/pay" style="margin:0">
-           <input type="hidden" name="plan" value="${id}">
-           <button type="submit" class="button" style="width:100%">Subscribe — ${formatMoney(amount)}</button>
-       </form>`}
+    ? `<p class="muted">You already have an active subscription.</p>`
+    : `<a class="button" href="/pay?plan=${id}">Choose ${name}</a>`}
 </div>`).join("")}
 </div>
 </div>`;
@@ -1115,15 +1086,7 @@ app.get("/payment/callback", async (req, res) => {
 </div></div>`));
         }
 
-        res.send(page(req, "Payment Successful", `
-<div class="container" style="max-width:650px"><div class="card">
-<h1>Payment Successful 🎉</h1>
-<div class="notice success">
-Your ${escapeHtml(getPlan(result.payment.plan)?.name || "subscription")} subscription is now active.
-</div>
-<p>Payment verified by Pesapal.</p>
-<a class="button" href="/account">Go to My Account</a>
-</div></div>`));
+        return res.redirect("/");
     } catch (error) {
         console.error("Pesapal callback verification error:", error?.data || error);
         res.status(502).send(page(req, "Payment Verification", `
