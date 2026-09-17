@@ -8,6 +8,7 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const { google } = require("googleapis");
 
 const app = express();
 
@@ -20,6 +21,23 @@ const PORT = Number(process.env.PORT || 3000);
 const VIDEO_DIR = path.join(__dirname, "videos");
 const POSTER_DIR = path.join(__dirname, "posters");
 const PUBLIC_DIR = path.join(__dirname, "public");
+
+// Google Drive storage
+const GOOGLE_DRIVE_FOLDER_ID =
+    String(process.env.GOOGLE_DRIVE_FOLDER_ID || "12cer3daRsszkVYmwnru6VyUG-UIdVagU").trim();
+const GOOGLE_CREDENTIALS_FILE = (() => {
+    const configured = String(process.env.GOOGLE_CREDENTIALS_FILE || "").trim();
+    if (configured) return configured;
+
+    try {
+        const match = fs.readdirSync(__dirname)
+            .find(name => /^client_secret_.*\.json$/i.test(name));
+        return match ? path.join(__dirname, match) : "";
+    } catch {
+        return "";
+    }
+})();
+const GOOGLE_TOKEN_FILE = path.join(__dirname, "google-token.json");
 
 for (const dir of [VIDEO_DIR, POSTER_DIR, PUBLIC_DIR]) {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -99,6 +117,9 @@ CREATE TABLE IF NOT EXISTS payments (
 // Safe migrations for payment gateway fields.
 try { db.exec("ALTER TABLE payments ADD COLUMN gateway_transaction_id TEXT"); } catch (e) {}
 try { db.exec("ALTER TABLE payments ADD COLUMN plan TEXT"); } catch (e) {}
+try { db.exec("ALTER TABLE movies ADD COLUMN drive_video_id TEXT"); } catch (e) {}
+try { db.exec("ALTER TABLE movies ADD COLUMN drive_poster_id TEXT"); } catch (e) {}
+try { db.exec("ALTER TABLE movies ADD COLUMN drive_video_size INTEGER"); } catch (e) {}
 
 db.exec(`CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
@@ -274,10 +295,183 @@ ${body}
 }
 
 // ===============================
+// GOOGLE DRIVE STORAGE
+// ===============================
+
+let driveClient = null;
+
+function getGoogleDriveClient() {
+    if (driveClient) return driveClient;
+
+    const clientId = String(process.env.GOOGLE_CLIENT_ID || "").trim();
+    const clientSecret = String(process.env.GOOGLE_CLIENT_SECRET || "").trim();
+    const refreshToken = String(process.env.GOOGLE_REFRESH_TOKEN || "").trim();
+
+    let credentials = null;
+
+    if (GOOGLE_CREDENTIALS_FILE && fs.existsSync(GOOGLE_CREDENTIALS_FILE)) {
+        credentials = JSON.parse(fs.readFileSync(GOOGLE_CREDENTIALS_FILE, "utf8")).web;
+    }
+
+    const finalClientId = clientId || credentials?.client_id || "";
+    const finalClientSecret = clientSecret || credentials?.client_secret || "";
+
+    if (!finalClientId || !finalClientSecret) {
+        throw new Error("Google Drive OAuth client credentials are not configured.");
+    }
+
+    const auth = new google.auth.OAuth2(
+        finalClientId,
+        finalClientSecret
+    );
+
+    if (refreshToken) {
+        auth.setCredentials({ refresh_token: refreshToken });
+    } else if (fs.existsSync(GOOGLE_TOKEN_FILE)) {
+        const token = JSON.parse(fs.readFileSync(GOOGLE_TOKEN_FILE, "utf8"));
+        auth.setCredentials(token);
+    } else {
+        throw new Error("Google Drive authorization token is not available.");
+    }
+
+    driveClient = google.drive({
+        version: "v3",
+        auth
+    });
+
+    return driveClient;
+}
+
+async function uploadToGoogleDrive(filePath, originalName, mimeType) {
+    const drive = getGoogleDriveClient();
+
+    const response = await drive.files.create({
+        requestBody: {
+            name: originalName,
+            parents: [GOOGLE_DRIVE_FOLDER_ID]
+        },
+        media: {
+            mimeType,
+            body: fs.createReadStream(filePath)
+        },
+        fields: "id,name,size,mimeType"
+    });
+
+    if (!response.data?.id) {
+        throw new Error("Google Drive did not return a file ID.");
+    }
+
+    return response.data;
+}
+
+async function deleteFromGoogleDrive(fileId) {
+    if (!fileId) return;
+
+    try {
+        const drive = getGoogleDriveClient();
+        await drive.files.delete({ fileId });
+    } catch (error) {
+        console.error("Google Drive delete error:", error?.message || error);
+    }
+}
+
+async function getGoogleDriveFileSize(fileId) {
+    const drive = getGoogleDriveClient();
+
+    const result = await drive.files.get({
+        fileId,
+        fields: "id,name,size,mimeType"
+    });
+
+    const size = Number(result.data?.size);
+    if (!Number.isFinite(size) || size < 0) {
+        throw new Error("Google Drive did not return a valid file size.");
+    }
+
+    return size;
+}
+
+async function streamGoogleDriveFile(fileId, req, res, fallbackContentType) {
+    const drive = getGoogleDriveClient();
+
+    const size = await getGoogleDriveFileSize(fileId);
+    const range = req.headers.range;
+
+    let start = 0;
+    let end = size - 1;
+
+    if (range) {
+        const match = range.match(/bytes=(\d*)-(\d*)/);
+
+        if (!match) {
+            res.setHeader("Content-Range", `bytes */${size}`);
+            return res.status(416).send("Invalid video range.");
+        }
+
+        if (match[1]) start = Number(match[1]);
+        if (match[2]) end = Number(match[2]);
+
+        if (!match[1] && match[2]) {
+            const suffixLength = Number(match[2]);
+            if (!Number.isFinite(suffixLength) || suffixLength <= 0) {
+                res.setHeader("Content-Range", `bytes */${size}`);
+                return res.status(416).send("Invalid video range.");
+            }
+            start = Math.max(0, size - suffixLength);
+            end = size - 1;
+        }
+
+        end = Math.min(end, size - 1);
+
+        if (
+            !Number.isFinite(start) ||
+            !Number.isFinite(end) ||
+            start < 0 ||
+            start > end ||
+            start >= size
+        ) {
+            res.setHeader("Content-Range", `bytes */${size}`);
+            return res.status(416).send("Invalid video range.");
+        }
+    }
+
+    const headers = {};
+    if (range) headers.Range = `bytes=${start}-${end}`;
+
+    const response = await drive.files.get(
+        {
+            fileId,
+            alt: "media"
+        },
+        {
+            responseType: "stream",
+            headers
+        }
+    );
+
+    const contentLength = end - start + 1;
+
+    res.writeHead(range ? 206 : 200, {
+        "Content-Range": range ? `bytes ${start}-${end}/${size}` : undefined,
+        "Accept-Ranges": "bytes",
+        "Content-Length": contentLength,
+        "Content-Type": fallbackContentType || "application/octet-stream"
+    });
+
+    response.data.on("error", error => {
+        console.error("Google Drive stream error:", error);
+        if (!res.headersSent) res.status(502).end();
+        else res.destroy(error);
+    });
+
+    response.data.pipe(res);
+}
+
+// ===============================
 // HOME
 // ===============================
 
-app.get("/", (req, res) => {
+app.get("/", requireUser, (req, res) => {
     const search = String(req.query.search || "").trim();
     const categoryId = Number(req.query.category || 0);
 
@@ -323,7 +517,7 @@ app.get("/", (req, res) => {
         ? movies.map(movie => `
 <div class="movie-card">
 ${movie.poster
-    ? `<img src="/posters/${encodeURIComponent(movie.poster)}" alt="${escapeHtml(movie.title)}">`
+    ? `<img src="/poster/${movie.id}" alt="${escapeHtml(movie.title)}">`
     : `<div class="no-poster">🎬</div>`}
 <div class="movie-info">
 <h3>${escapeHtml(movie.title)}</h3>
@@ -366,10 +560,58 @@ ${categories.map(c => `<option value="${c.id}" ${categoryId === c.id ? "selected
 });
 
 // ===============================
+// PROTECTED POSTER
+// ===============================
+
+app.get("/poster/:id", requireUser, async (req, res) => {
+    const movie = db.prepare("SELECT * FROM movies WHERE id = ?").get(req.params.id);
+
+    if (!movie) return res.status(404).send("Movie not found.");
+
+    try {
+        if (movie.drive_poster_id) {
+            const drive = getGoogleDriveClient();
+            const response = await drive.files.get(
+                {
+                    fileId: movie.drive_poster_id,
+                    alt: "media"
+                },
+                {
+                    responseType: "stream"
+                }
+            );
+
+            res.setHeader(
+                "Content-Type",
+                response.headers["content-type"] || "image/jpeg"
+            );
+
+            return response.data.pipe(res);
+        }
+
+        if (!movie.poster) return res.status(404).send("Poster not found.");
+
+        const posterPath = path.join(
+            POSTER_DIR,
+            path.basename(movie.poster)
+        );
+
+        if (!fs.existsSync(posterPath)) {
+            return res.status(404).send("Poster not found.");
+        }
+
+        return res.sendFile(posterPath);
+    } catch (error) {
+        console.error("Poster error:", error?.message || error);
+        res.status(502).send("Unable to load poster.");
+    }
+});
+
+// ===============================
 // MOVIE DETAILS
 // ===============================
 
-app.get("/movie/:id", (req, res) => {
+app.get("/movie/:id", requireUser, (req, res) => {
     const movie = db.prepare(`
         SELECT movies.*, categories.name AS category_name
         FROM movies
@@ -397,7 +639,7 @@ app.get("/movie/:id", (req, res) => {
 <div class="container">
 <a class="muted" href="/">← Back to movies</a>
 <div class="card" style="margin-top:20px">
-${movie.poster ? `<img class="poster" src="/posters/${encodeURIComponent(movie.poster)}" alt="${escapeHtml(movie.title)}">` : ""}
+${movie.poster ? `<img class="poster" src="/poster/${movie.id}" alt="${escapeHtml(movie.title)}">` : ""}
 <h1>${escapeHtml(movie.title)}</h1>
 <p class="muted">${escapeHtml(movie.category_name || "Uncategorized")}${movie.year ? " • " + movie.year : ""}${movie.duration ? " • " + escapeHtml(movie.duration) : ""}</p>
 <p>${escapeHtml(movie.description || "")}</p>
@@ -412,52 +654,82 @@ ${action}
 // PROTECTED STREAM
 // ===============================
 
-app.get("/stream/:id", requireSubscription, (req, res) => {
+app.get("/stream/:id", requireSubscription, async (req, res) => {
     const movie = db.prepare("SELECT * FROM movies WHERE id = ?").get(req.params.id);
 
     if (!movie) return res.status(404).send("Movie not found.");
 
-    const safeFilename = path.basename(movie.filename);
-    const videoPath = path.join(VIDEO_DIR, safeFilename);
-
-    if (!fs.existsSync(videoPath)) return res.status(404).send("Video file not found.");
-
-    const stat = fs.statSync(videoPath);
-    const fileSize = stat.size;
     const contentType = getVideoContentType(movie.filename);
-    const range = req.headers.range;
 
-    if (!range) {
-        res.writeHead(200, {
-            "Content-Length": fileSize,
-            "Content-Type": contentType,
-            "Accept-Ranges": "bytes"
+    try {
+        if (movie.drive_video_id) {
+            return await streamGoogleDriveFile(
+                movie.drive_video_id,
+                req,
+                res,
+                contentType
+            );
+        }
+
+        // Backward compatibility for movies uploaded before Google Drive storage.
+        const safeFilename = path.basename(movie.filename);
+        const videoPath = path.join(VIDEO_DIR, safeFilename);
+
+        if (!fs.existsSync(videoPath)) {
+            return res.status(404).send("Video file not found.");
+        }
+
+        const stat = fs.statSync(videoPath);
+        const fileSize = stat.size;
+        const range = req.headers.range;
+
+        if (!range) {
+            res.writeHead(200, {
+                "Content-Length": fileSize,
+                "Content-Type": contentType,
+                "Accept-Ranges": "bytes"
+            });
+            return fs.createReadStream(videoPath).pipe(res);
+        }
+
+        const match = range.match(/bytes=(\d*)-(\d*)/);
+        if (!match) return res.status(416).send("Invalid range.");
+
+        const start = match[1]
+            ? Number(match[1])
+            : Math.max(0, fileSize - Number(match[2] || 0));
+        const requestedEnd = match[2] ? Number(match[2]) : fileSize - 1;
+        const end = Math.min(requestedEnd, fileSize - 1);
+
+        if (
+            !Number.isFinite(start) ||
+            !Number.isFinite(end) ||
+            start < 0 ||
+            start > end ||
+            start >= fileSize
+        ) {
+            res.setHeader("Content-Range", `bytes */${fileSize}`);
+            return res.status(416).send("Invalid video range.");
+        }
+
+        const chunkSize = end - start + 1;
+
+        res.writeHead(206, {
+            "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+            "Accept-Ranges": "bytes",
+            "Content-Length": chunkSize,
+            "Content-Type": contentType
         });
-        return fs.createReadStream(videoPath).pipe(res);
+
+        fs.createReadStream(videoPath, { start, end }).pipe(res);
+    } catch (error) {
+        console.error("Video stream error:", error?.message || error);
+        if (!res.headersSent) {
+            res.status(502).send("Unable to stream video from Google Drive.");
+        } else {
+            res.destroy(error);
+        }
     }
-
-    const match = range.match(/bytes=(\d*)-(\d*)/);
-    if (!match) return res.status(416).send("Invalid range.");
-
-    const start = match[1] ? Number(match[1]) : Math.max(0, fileSize - Number(match[2] || 0));
-    const requestedEnd = match[2] ? Number(match[2]) : fileSize - 1;
-    const end = Math.min(requestedEnd, fileSize - 1);
-
-    if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || start > end || start >= fileSize) {
-        res.setHeader("Content-Range", `bytes */${fileSize}`);
-        return res.status(416).send("Invalid video range.");
-    }
-
-    const chunkSize = end - start + 1;
-
-    res.writeHead(206, {
-        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
-        "Accept-Ranges": "bytes",
-        "Content-Length": chunkSize,
-        "Content-Type": contentType
-    });
-
-    fs.createReadStream(videoPath, { start, end }).pipe(res);
 });
 
 // ===============================
@@ -564,7 +836,7 @@ ${message}
     res.send(page(req, "Login", body));
 });
 
-app.post("/api/login", (req, res) => {
+app.post("/api/login", (req, res, next) => {
     const email = String(req.body.email || "").trim().toLowerCase();
     const password = String(req.body.password || "");
 
@@ -576,7 +848,11 @@ app.post("/api/login", (req, res) => {
 
     req.session.userId = user.id;
     req.session.userName = user.name;
-    res.redirect("/");
+    const activeSubscription = getActiveSubscription(user.id);
+    req.session.save(err => {
+        if (err) return next(err);
+        res.redirect(activeSubscription ? "/" : "/subscribe");
+    });
 });
 
 app.get("/logout", (req, res) => {
@@ -1411,7 +1687,7 @@ const upload = multer({
 // ===============================
 
 app.post("/api/admin/upload", requireAdmin, (req, res) => {
-    upload(req, res, err => {
+    upload(req, res, async err => {
         if (err) {
             console.error(err);
             return res.status(400).send("Upload failed: " + escapeHtml(err.message));
@@ -1430,24 +1706,68 @@ app.post("/api/admin/upload", requireAdmin, (req, res) => {
 
             if (!title) return res.status(400).send("Movie title is required.");
 
-            const videoFilename = req.files.video[0].filename;
-            const posterFilename = req.files.poster && req.files.poster[0]
-                ? req.files.poster[0].filename
+            const videoFile = req.files.video[0];
+            const posterFile = req.files.poster && req.files.poster[0]
+                ? req.files.poster[0]
                 : null;
+
+            let videoDrive = null;
+            let posterDrive = null;
+
+            try {
+                videoDrive = await uploadToGoogleDrive(
+                    videoFile.path,
+                    videoFile.originalname,
+                    videoFile.mimetype || getVideoContentType(videoFile.originalname)
+                );
+
+                if (posterFile) {
+                    posterDrive = await uploadToGoogleDrive(
+                        posterFile.path,
+                        posterFile.originalname,
+                        posterFile.mimetype || "image/jpeg"
+                    );
+                }
+            } catch (driveError) {
+                console.error("Google Drive upload error:", driveError?.message || driveError);
+
+                if (videoDrive?.id) await deleteFromGoogleDrive(videoDrive.id);
+                if (posterDrive?.id) await deleteFromGoogleDrive(posterDrive.id);
+
+                return res.status(502).send(page(req, "Google Drive Error", `
+<div class="container" style="max-width:700px"><div class="card">
+<h1>Movie upload failed</h1>
+<div class="notice error">${escapeHtml(driveError.message || "Could not upload the movie to Google Drive.")}</div>
+<p>The movie was not added to the MyStream database.</p>
+<a class="button" href="/admin/dashboard">Back to Admin</a>
+</div></div>`));
+            }
 
             db.prepare(`
                 INSERT INTO movies
-                (title, description, filename, poster, category_id, year, duration)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                (title, description, filename, poster, category_id, year, duration,
+                 drive_video_id, drive_poster_id, drive_video_size)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             `).run(
                 title,
                 description,
-                videoFilename,
-                posterFilename,
+                videoFile.originalname,
+                posterFile ? posterFile.originalname : null,
                 categoryId || null,
                 year || null,
-                duration
+                duration,
+                videoDrive.id,
+                posterDrive ? posterDrive.id : null,
+                Number(videoDrive.size || 0)
             );
+
+            // Google Drive is now the permanent storage location.
+            try {
+                if (fs.existsSync(videoFile.path)) fs.unlinkSync(videoFile.path);
+                if (posterFile && fs.existsSync(posterFile.path)) fs.unlinkSync(posterFile.path);
+            } catch (cleanupError) {
+                console.error("Temporary upload cleanup error:", cleanupError);
+            }
 
             res.redirect("/admin/dashboard");
         } catch (error) {
@@ -1461,25 +1781,34 @@ app.post("/api/admin/upload", requireAdmin, (req, res) => {
 // ADMIN DELETE MOVIE
 // ===============================
 
-app.post("/api/admin/delete-movie", requireAdmin, (req, res) => {
+app.post("/api/admin/delete-movie", requireAdmin, async (req, res) => {
     const id = Number(req.body.id);
 
     const movie = db.prepare("SELECT * FROM movies WHERE id = ?").get(id);
 
     if (!movie) return res.status(404).send("Movie not found.");
 
-    const videoPath = path.join(VIDEO_DIR, path.basename(movie.filename));
-    const posterPath = movie.poster
-        ? path.join(POSTER_DIR, path.basename(movie.poster))
-        : null;
-
     db.prepare("DELETE FROM movies WHERE id = ?").run(id);
 
     try {
+        if (movie.drive_video_id) {
+            await deleteFromGoogleDrive(movie.drive_video_id);
+        }
+
+        if (movie.drive_poster_id) {
+            await deleteFromGoogleDrive(movie.drive_poster_id);
+        }
+
+        // Backward compatibility for old local movies.
+        const videoPath = path.join(VIDEO_DIR, path.basename(movie.filename));
+        const posterPath = movie.poster
+            ? path.join(POSTER_DIR, path.basename(movie.poster))
+            : null;
+
         if (fs.existsSync(videoPath)) fs.unlinkSync(videoPath);
         if (posterPath && fs.existsSync(posterPath)) fs.unlinkSync(posterPath);
     } catch (error) {
-        console.error("File cleanup error:", error);
+        console.error("Movie storage cleanup error:", error);
     }
 
     res.redirect("/admin/dashboard");
@@ -1512,6 +1841,11 @@ app.listen(PORT, () => {
     console.log("");
     console.log("Pesapal payments: " + (process.env.PESAPAL_CONSUMER_KEY && process.env.PESAPAL_CONSUMER_SECRET ? "credentials configured" : "NOT CONFIGURED"));
     console.log("Pesapal IPN: " + (getSetting("pesapal_ipn_id") || process.env.PESAPAL_IPN_ID ? "registered/configured" : "NOT REGISTERED"));
+    console.log("Google Drive storage: " + (
+        GOOGLE_DRIVE_FOLDER_ID
+            ? "configured"
+            : "NOT CONFIGURED"
+    ));
     console.log("Local test subscriptions are enabled unless NODE_ENV=production.");
     console.log("");
 });

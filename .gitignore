@@ -6,3 +6,5 @@ database.db-wal
 videos/
 posters/
 *.log
+google-token.json
+client_secret_*.json
